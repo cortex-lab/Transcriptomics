@@ -1,6 +1,6 @@
 # Transcriptomics
 
-Data for analysis of single cell RNA sequencing data.
+MATLAB code for analysis of single cell RNA sequencing data.
 
 The main wrapper class for transcriptomic data is GeneSet. It contains a lot of visualization routines, plus some old clustering methods (Harris et al bioRxiv 2015).
 
