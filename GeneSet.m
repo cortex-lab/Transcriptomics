@@ -20,6 +20,7 @@ classdef GeneSet
         CellName; % a name for every cell, to help you remember them.
         Excluded; % a GeneSet containing any 
         tSNE; % a 2 by nCells array giving the output of tSNE dim reduction
+        FavGenes; % string list of useful genes, eg produced by MixNB, used for tSNE
         
         GeneCorrels; % nGenes x nGenes array to speed up MDS. Calculated only when needed
     end
@@ -91,11 +92,11 @@ classdef GeneSet
                 g.CellInfo = struct;
                 for i=1:length(ColInfo.Datasets);
                     FieldName = ColInfo.Datasets(i).Name;
-                    AttrName = FieldName;
+                    AttrName = genvarname(FieldName);
                     AttrName(FieldName==' ') = '_'; % get rid of spaces
-                    if AttrName(1)=='_'
-                        AttrName = AttrName(2:end);
-                    end
+%                     if AttrName(1)=='_'
+%                         AttrName = AttrName(2:end);
+%                     end
                     g.CellInfo = setfield(g.CellInfo, AttrName, h5read(FileName, ['/col_attrs/' FieldName]));
                     g.CellInfo.Loom_Row = (1:g.nCells)';
                     g.CellInfo.Loom_File = repmat({FileName},[g.nCells,1]); 
@@ -151,11 +152,16 @@ classdef GeneSet
 
                 % give the cells some memorable names
                 g.CellName=RandomNames(g.nCells);
-            elseif strcmpi(Extension, '.tsv')
-                fprintf('Loading tsv file %s with %d header lines\n', FileName, nHeaderLines);
+            elseif strcmpi(Extension, '.tsv') || strcmpi(Extension, '.csv')
+                fprintf('Loading %s file %s with %d header lines\n', Extension(2:end), FileName, nHeaderLines);
                 
                 % read in actual data
-                g.GeneExp = dlmread(FileName, '\t', nHeaderLines,1);
+                if strcmpi(Extension, '.tsv')
+                    dlm = '\t';
+                elseif strcmpi(Extension, '.csv')
+                    dlm = ',';
+                end
+                g.GeneExp = dlmread(FileName, dlm, nHeaderLines,1);
                 g.nGenes = size(g.GeneExp,1);
                 
                 
@@ -163,8 +169,8 @@ classdef GeneSet
                 fid = fopen(FileName, 'r');
                 for i=1:nHeaderLines
                     Line = fgetl(fid);
-                    SplitLine = strsplit(Line, '\t');
-                    g.CellInfo = setfield(g.CellInfo, SplitLine{1}, SplitLine(2:end)');
+                    SplitLine = strsplit(Line, dlm);
+                    g.CellInfo = setfield(g.CellInfo, genvarname(SplitLine{1}), SplitLine(2:end)');
                     if i==1
                         g.nCells = length(SplitLine)-1;
                     elseif g.nCells ~= length(SplitLine)-1
@@ -173,13 +179,33 @@ classdef GeneSet
                 end
 
                 % read gene names
-                tmp = textscan(fid, ['%s %*[^\r\n]'], g.nGenes);
+                tmp = textscan(fid, ['%s %*[^\r\n]'], g.nGenes, 'Delimiter', dlm);
                 g.GeneName= tmp{1};
                 fclose(fid);
 
                 % give them random names
                 g.CellName=RandomNames(g.nCells);
 
+            elseif strcmpi(Extension, '.mtx') 
+                % supposed to by 10x format, so far only used for Xie et al data
+                % first line after Headers gives matrix size then nNonZero
+                if nargin<2 || isempty(nHeaderLines); nHeaderLines=2; end
+                fid = fopen(FileName, 'r');
+                for i=1:nHeaderLines
+                    HeaderLine = fgetl(fid);
+                end
+                Shape = sscanf(HeaderLine, '%d');
+                Matrix = textscan(fid, '%d %d %d\n');
+                fclose(fid);
+                g.GeneExp = accumarray([Matrix{1}, Matrix{2}], Matrix{3}, Shape(1:2)');
+                
+                % now load gene names as second column of _features file
+                fName = [FileName(1:end-10) 'features.tsv'];
+                Features = readmatrix(fName, 'OutputType', 'string', 'FileType', 'text');
+                g.GeneName=Features(:,2);
+                
+                [g.nGenes, g.nCells] = size(g.GeneExp);
+                g.CellName=RandomNames(g.nCells);
                 
             else
                 error('Unknown file extension');
@@ -374,16 +400,18 @@ classdef GeneSet
             h = vertcat(h1, g.Excluded);
         end
         
-        function h = ReClass(g, NewClass);
+        function h = ReClass(g, NewClass)
             % h = ReClass(g, NewClass);
             % changes the Class attribute to NewClass
             %
             % if a string, uses that structure of CellInfo
             % if numeric, convert to strings (no space padding)
             % if a containers.Map, use that to convert 
+            % if a single-element cellstr, they all become that.
             % otherwise uses as-is
             
             h = g;
+            h.CellInfo.OldClass = g.Class;
             if isempty(NewClass)
                 h.Class = repmat({''}, g.nCells,1);
             elseif isstr(NewClass)
@@ -395,6 +423,8 @@ classdef GeneSet
                 for i=1:max(ClassNo)
                     h.Class(ClassNo==i) = {NewClass(uClass{i})};
                 end
+            elseif iscellstr(NewClass) && numel(NewClass)==1
+                h.Class = repmat(NewClass, g.nCells, 1);
             else
                 h.Class = NewClass;
             end
@@ -406,12 +436,34 @@ classdef GeneSet
             
             h = g;
             [ClassNames, ~, ClassNum] = unique(g.Class);
-            for k=1:length(g.Class);
+            for k=1:length(ClassNum);
                 MyCells = find(ClassNum==k);
                 h.GeneExp(:,MyCells) = repmat(median(g.GeneExp(:,MyCells),2), [1 length(MyCells)]);
             end
         end
             
+        function h = ClassSummary(g, summary_func)
+            % h = ClassSummary(g, summary_func)
+            % makes a new geneset where there is one "cell" per class, and
+            % expression is the median of the full one.
+            %
+            % summary_func is function handle saying how to summarize (default is @median)
+            
+            if nargin<2; summary_func=@median; end
+            h = GeneSet;
+            [ClassNames, ~, ClassNum] = unique(g.Class);
+            h.nCells = length(ClassNames);
+            h.nGenes = g.nGenes;
+            h.CellName = ClassNames;
+            h.Class = ClassNames;
+            h.GeneName = g.GeneName;
+            h.GeneExp = zeros(h.nGenes,h.nCells);
+            for k=1:length(h.Class)
+                MyCells = (ClassNum==k);
+                h.GeneExp(:,k) = summary_func(g.GeneExp(:,MyCells),2);
+                h.CellInfo.nCells(k) = sum(MyCells);
+            end
+        end
         
         function [h, Cells] = CellSubset(g, varargin)
             % [h, CellIDs] = CellSubset(g, Cells, Exclude)
@@ -429,6 +481,7 @@ classdef GeneSet
             h.GeneExp = g.GeneExp(:,Cells);
             h.GeneName = g.GeneName;
             h.nGenes = g.nGenes;
+            h.FavGenes = g.FavGenes;
             h.nCells = length(Cells);
             if ~isempty(g.CellName), h.CellName = g.CellName(Cells); end
             if ~isempty(g.tSNE), h.tSNE = g.tSNE(:,Cells); end
@@ -438,7 +491,11 @@ classdef GeneSet
                 fn = fieldnames(g.CellInfo);
                 for i=1:length(fn)
                     Data = getfield(g.CellInfo, fn{i});
-                    h.CellInfo = setfield(h.CellInfo, fn{i}, Data(Cells));
+                    if ~isempty(Data)
+                        h.CellInfo = setfield(h.CellInfo, fn{i}, Data(Cells));
+                    else
+                        h.CellInfo = setfield(h.CellInfo, fn{i}, Data);
+                    end
                 end
             end
             
@@ -593,7 +650,12 @@ classdef GeneSet
             Not0Norm = (Norm>0);
             h = g.CellSubset(Not0Norm);
 
-            h.GeneExp = bsxfun(@rdivide, g.GeneExp(:,Not0Norm), Norm(Not0Norm).^p);
+            %h.GeneExp = bsxfun(@rdivide, g.GeneExp(:,Not0Norm), Norm(Not0Norm).^p);
+            if ~isfloat(g.GeneExp)
+                h.GeneExp = double(g.GeneExp(:,Not0Norm)) ./ Norm(Not0Norm).^p;
+            else
+                h.GeneExp = g.GeneExp(:,Not0Norm) ./ Norm(Not0Norm).^p;
+            end
             
             ScaleFac = (sum(g.GeneExp(:).^q)/sum(h.GeneExp(:).^q)).^(1/q);
             h.GeneExp = h.GeneExp*ScaleFac;
@@ -637,8 +699,27 @@ classdef GeneSet
 
             h.GeneExp = [g1.GeneExp, g2.GeneExp];
             h.nCells = g1.nCells + g2.nCells;
+            
+            if isempty(g1.Class) 
+                g1.Class = repmat({'_Unclassified'}, g1.nCells, 1);
+            end
+            if isempty(g2.Class)
+                g2.Class = repmat({'_Unclassified'}, g2.nCells, 1);
+            end
             h.Class = vertcat(g1.Class(:), g2.Class(:));
+            
+            if isempty(g1.CellName)
+                g1.CellName = repmat({'_NoName'}, g1.nCells, 1);
+            end
+            if isempty(g2.CellName)
+                g2.CellName = repmat({'_NoName'}, g2.nCells, 1);
+            end
             h.CellName = vertcat(g1.CellName(:), g2.CellName(:));
+            
+            
+            if ~isempty(g1.tSNE) & ~isempty(g2.tSNE) 
+                h.tSNE = [g1.tSNE, g2.tSNE];
+            end
             
             if ~isempty(g1.CellInfo) & ~isempty(g2.CellInfo)
                 % merge cell info (this is the hard part)
@@ -648,12 +729,14 @@ classdef GeneSet
                      f = CellInfoFields{i};
     %                 if isfield(g2.CellInfo, f)
                     c1 = getfield(g1.CellInfo,f);
+                    if length(c1)==0; continue; end;
                     if length(c1)~=g1.nCells
                         error(sprintf('CellInfo.%s has %d entries instead of %d', ...
                             f, length(c1), g1.nCells));
                     end
 
                     c2 = getfield(g2.CellInfo,f);
+                    if length(c2)==0; continue; end;
                     if length(c2)~=g2.nCells
                         error(sprintf('Arg1 CellInfo.%s has %d entries instead of %d', ...
                             f, length(c2), g2.nCells));
@@ -665,6 +748,11 @@ classdef GeneSet
                         c2 = cellstr(num2str(c2));
                     end
 
+                    % transpose if required (why oh why can't matlab have
+                    % 1d arrays)
+                    if size(c1,1)==1 && size(c1,2)>1; c1=c1'; end
+                    if size(c2,1)==1 && size(c2,2)>1; c2=c2'; end
+                    
                     NewCellInfo = setfield(NewCellInfo, f, [c1; c2]);
 
     %                 else
@@ -789,7 +877,7 @@ classdef GeneSet
         
 
            
-        function Scatter(g, xGene, yGene, Group, Jitter, varargin);
+        function Scatter(g, xGene, yGene, Group, Jitter, varargin)
             % Scatter(xGene, yGene, Group, Jitter, varargin);
             %
             % plot a scatter plot. xGene is a numeric index or name of the
@@ -799,11 +887,19 @@ classdef GeneSet
             % Group determines colors (see gscatter)
             %
             % Jitter defaults to 0.3
-            % varargin is passed to gscatter
+            % varargin is passed to gscatter - if it contains 'noline', no
+            % fit line will be plotted
     
            
-            if nargin<5
+            if nargin<5 | isempty(Jitter)
                 Jitter = 0.3;
+            end
+            
+            if length(varargin)>=1 & strcmp(varargin{1}, 'noline')
+                noline=1;
+                varargin = varargin(2:end);
+            else
+                noline = 0;
             end
             
             if isnumeric(xGene) & length(xGene)==g.nCells
@@ -840,19 +936,21 @@ classdef GeneSet
             Sym = repmat('o+*hxsd^<v>p', [1 ceil(nGroups/12)]);
             
            
-            hold off
+            hold off;
             
             if isempty(Group) | length(Group)==1
                  gscatter(xData+rand(1,g.nCells)*Jitter, yData+rand(1,g.nCells)*Jitter, varargin);
-            else
-                gscatter(xData+rand(1,g.nCells)*Jitter, yData+rand(1,g.nCells)*Jitter, Group, ColorMap, Sym', varargin);%, 'interpreter', 'none');
+            elseif ~isempty(varargin)
+                gscatter(xData+rand(1,g.nCells)*Jitter, yData+rand(1,g.nCells)*Jitter, Group(:), ColorMap, Sym', varargin);%, 'interpreter', 'none');
+            else 
+                gscatter(xData+rand(1,g.nCells)*Jitter, yData+rand(1,g.nCells)*Jitter, Group(:), ColorMap, Sym');%, 'interpreter', 'none');
             end
             xlabel(xl, 'Interpreter', 'none');
             ylabel(yl, 'Interpreter', 'none');
             
             
             % now fit line
-            if g.nCells>0
+            if g.nCells>0 && ~noline
                 [b bint r rint stats] = regress(yData(:), [xData(:), ones(nPoints,1)]);
                 [rho p] = corr(yData(:), xData(:), 'type', 'Spearman');
 
@@ -1275,72 +1373,6 @@ classdef GeneSet
             set(h, 'color', 'b');
 
         end
-            
-                
-        
-%         function [Clu, GeneID, Thresh] = Bisect(g, CandidateGenes);
-%             % [Clu, GeneID, Thresh] = Bisect(g, CandidateGenes);
-%             %
-%             % Finds a optimal bisection of the cells into two groups:
-%             % GeneID<=Thresh and GeneID>Thresh
-%             %
-%             % Optimality criterion is low cosine angle of between group
-%             % means
-%             %
-%             
-%             % compute matrix of cosine angles from L2 normalized vectors 
-%             % PREMATURE OPTIMIZATION IS THE ROOT OF ALL EVIL
-% %             fprintf('Computing kernel matrix ....');
-%              NormExp = bsxfun(@rdivide, g.GeneExp,sqrt(sum(g.GeneExp.^2,1)));
-% %             C = NormExp*NormExp';
-% %             fprintf('Done\n');
-% 
-%             % loop through candidate genes
-%             CandidateGenes = g.NamesToIDs(CandidateGenes);
-%             nCandidates = length(CandidateGenes);
-%             Scores = zeros(nCandidates, g.nCells-1); % because there are nCells-1 possible nonempty splits
-%             Sorteds = zeros(nCandidates, g.nCells);
-%             for i=1:length(CandidateGenes)
-%                 % sort matrix by expression of candidate gene
-%                 [sorted order] = sort(g.GeneExp(CandidateGenes(i),:), 'ascend');
-%                 Sorteds(i,:) = sorted;
-%                 
-%                 % cumulative sum of gene expression will help us make averages
-%                 CumSum = cumsum(NormExp(:,order),2);
-%                 
-%                 % now mean of below threshold elements (leave out last to
-%                 % avoid divide by zero)
-%                 nBelow = 1:g.nCells-1;
-%                 MeanBelow = bsxfun(@rdivide, CumSum(:,1:g.nCells-1), nBelow);
-%                 % normalize
-%                 nMeanBelow = bsxfun(@rdivide, MeanBelow, sqrt(sum(MeanBelow.^2,1)));
-%                 
-%                 % now mean of above threshold elemtns
-%                 nAbove = g.nCells-1:-1:1;
-%                 AboveSum = bsxfun(@minus, CumSum(:,end), CumSum);
-%                 MeanAbove = bsxfun(@rdivide, AboveSum(:,1:g.nCells-1), nAbove);
-%                 % normalize
-%                 nMeanAbove = bsxfun(@rdivide, MeanAbove, sqrt(sum(MeanAbove.^2,1)));
-%                 
-%                 % now compute mean dot product of vectors with respective
-%                 % means. Math trick lets us do this as |mu|^2*N
-%                 
-%                 Scores(i,:) = bsxfun(@times,sqrt(sum(MeanBelow.^2,1)),nBelow) + bsxfun(@times, sqrt(sum(MeanAbove.^2,1)), nAbove); 
-%             end
-%             
-%             [BestScore, BestInd] = max(Scores(:));
-%             [sBestGene, sBestThresh] = ind2sub([nCandidates, g.nCells-1], BestInd);
-%             
-%             GeneID = CandidateGenes(sBestGene);
-%             Thresh = Sorteds(sBestGene,sBestThresh);
-%             Clu = 1+(g.GeneExp(GeneID,:)>Thresh);
-%             fprintf('Criterion: %s > %f, Score %f\n', g.IDsToNames(GeneID), Thresh, BestScore);
-%         end
-%                 
-% 
-
-
-                    
         
         function SortedNames = BestPredictors(g,nc, lambda, StartSet, MaxLoops)
             % BestPredictors(n, lambda, StartSet, MaxLoops)
@@ -1655,8 +1687,8 @@ classdef GeneSet
 
             c = zTarget'*z/double(g.nCells);
 
-            [dsorted dorder] = sort(c, 'descend');
-            [asorted aorder] = sort(c, 'ascend');
+            [dsorted, dorder] = sort(c, 'descend');
+            [asorted, aorder] = sort(c, 'ascend');
             if nFriends>0
                 sorted = [asorted(1:nFriends), dsorted(StartFrom:nFriends+1)]; % first dsorted will be gene itself
                 order = [aorder(1:nFriends), dorder(StartFrom:nFriends+1)];
@@ -1690,6 +1722,8 @@ classdef GeneSet
                 if strcmp(str, 'w')
                     system(['start chrome "http://mouse.brain-map.org/search/show?search_type=gene&search_term=' g.GeneName{order(i)} '"']);
                     system(['start chrome "http://www.ncbi.nlm.nih.gov/omim/?term=' g.GeneName{order(i)} '"']);
+                    system(['start chrome "http://mousebrain.org/genes/' g.GeneName{order(i)} '"']);
+
                 end
 
             end
@@ -1743,6 +1777,7 @@ classdef GeneSet
                         if strcmp(str, 'w')
                             system(['start chrome "http://mouse.brain-map.org/search/show?search_type=gene&search_term=' g.GeneName{Gene(i)} '"']);
                             system(['start chrome "http://www.ncbi.nlm.nih.gov/omim/?term=' g.GeneName{Gene(i)} '"']);
+                            system(['start chrome "http://mousebrain.org/genes/' g.GeneName{order(i)} '"']);
                         end
                     end
                 end
@@ -1750,7 +1785,7 @@ classdef GeneSet
             
         end
         
-        function Heatmap(g, Genes, Class, ClassNames)
+        function Heatmap(g, Genes, Class)
             % Heatmap(g, Genes, Classes)
             %
             % Plot a heatmap of a subset of genes showing the mean
@@ -1825,6 +1860,74 @@ classdef GeneSet
             end
 
         end
+        
+        function Barmap(g, Genes, Clf)
+            % Barmap(g, Genes)
+            % makes a barchart where the height of each bar is an
+            % expression level
+            
+            [ClassNames, ~, k] = unique(g.Class, 'stable');
+            nK = max(k);
+            nC = g.nCells;
+            nG = length(Genes);
+
+            x0 = log10(1+g.Exp(Genes));
+            x = x0./max(x0,[],2);
+            
+            % sort genes
+            gPos = (x./sum(x,2))*(1:nC)';
+            [sorted, order] = sort(gPos, 'descend');
+
+            if nargin<3
+                Clr0 = HsvNotYellow(ceil(nK*1.2)); % turn down green so can see yellow, 1.2 so ends not identical
+                ClrMap = Clr0(1:nK,:);
+            end
+            
+            
+            % make y position for each cell
+            y0 = zeros(nC,nG);
+            y1 = zeros(nC,nG);
+            x0 = zeros(nC,nG);
+            x1 = zeros(nC,nG);
+            Clr = zeros(nC,nG,3);
+            
+            
+            
+            for i=1:nK
+                MyCells = (i==k);
+                nMy = sum(MyCells);
+                MyExp = x(order,MyCells)';
+
+                if 0 % vertical tracks
+                    y0(MyCells,:) = repmat(i+(0:nMy-1)'/nMy,1,nG);
+                    y1(MyCells,:) = repmat(i+(1:nMy)'/nMy,1,nG);
+                    x0(MyCells,:) = repmat(1:nG,nMy,1);
+                    x1(MyCells,:) = repmat(1:nG,nMy,1) + MyExp./MaxExp;
+                else
+                    x0(MyCells,:) = (0:nMy-1)'/nMy + (1:nG);
+                    x1(MyCells,:) = (1:nMy)'/nMy + (1:nG);
+                    y0(MyCells,:) = repmat(i,[nMy, nG]);
+                    y1(MyCells,:) = repmat(i,[nMy, nG]) + MyExp;
+                end
+
+                Clr(MyCells,:,:) = repmat(shiftdim(ClrMap(i,:),-1),[nMy nG 1]);
+            end
+            
+            
+            cla; hold on;
+            patch([x0(:), x1(:), x1(:), x0(:), x0(:)]', ...
+                [y0(:), y0(:), y1(:), y1(:), y0(:)]', ...
+                reshape(Clr,[nC*nG,1,3]),...
+                'edgecolor', 'none' );
+            for i=1:nG
+                plot([i;i]+1, [1;nK+1], 'k:');
+                h = text(i+.5, nK+1, Genes{order(i)});
+                h.Rotation=90;
+            end
+            axis off;
+        end
+            
+
 
         
         function [gFactors, gScores] = Nnmf(g, SeedGenes)
@@ -2272,15 +2375,19 @@ classdef GeneSet
         end
 
         
-        function h = GeneScatter(g, c1, c2, GenesToShow, Jitter, Highlight)
-            % h = GeneScatter(g, c1, c2, GenesToShow)
+        function h = GeneScatter(g, c1, c2, Prctile, GenesToShow, Jitter, Highlight)
+            % h = GeneScatter(g, c1, c2, Prctile, GenesToShow, Jitter, Highlight)
             % plots expression of all genes in c1 vs in c2
             % with text labels by points.            
             %
-            % If c1 and c2 are vectors of length g.nGenes, it plots these
-            % Otherwise then can be groups of cells: it uses IdentifyCells, and
-            % takes the 34% trimmean of those cells. c2 empty or missing => all but
-            % c1. If some cells are in both, they are removed from group c2
+            % c1 and c2 are decoded using IdentifyCells. 
+            % c2 empty or missing => all but c1. If some cells are in both, 
+            % they are removed from group c2
+            %
+            % For each gene it computes the Prctile'th (default 90) percentile of
+            % expression in both classes, and plots them in a scatter. 0 means 34% trim mean
+            % If c1 or c2 is a numeric vector of length nGenes it uses this
+            % instead. Two element vector means use those for c1 and c2
             %
             % GenesToShow says which genes to plot. If this is a single number, 
             % the function will plot that many that have largest difference index.
@@ -2293,36 +2400,48 @@ classdef GeneSet
             
             reg = 1; % regularization parameter, for choosing which to show
             
+            
             % names will be useful to plot stuff later
             oc1 = c1; 
-            if nargin>=3; 
+            if nargin>=3
                 oc2 = c2; 
             else
                 oc2 = '';
-            end;
+            end
             
-            % compute what genes to show - default 100 top of each class
-            if nargin<4; GenesToShow = min(100,g.nGenes); end;
-            if nargin<5; Jitter = .02; end;
-            if nargin<6; 
+            if nargin<4 || isempty(Prctile)
+                Prctile = [90, 90]; % use this percentile to compute expression. 
+            end
+            if nargin<5 || isempty(GenesToShow)
+                GenesToShow = min(100,g.nGenes); 
+            end
+            if nargin<6; Jitter = .02; end;
+            if nargin<7 
                 Highlight = [];
                 RegularColor = 'b';
                 HighlightColor = 'k';
             else
                 RegularColor = [.4 .4 1];
                 HighlightColor = 'k';
-            end; 
+            end
             Highlight = g.NamesToIDs(Highlight);
 
+            if length(Prctile)==1
+                Prctile = Prctile*[1,1];
+            end
             
             % get mean vector for c1
-            if isnumeric(c1) & (length(c1)==g.nGenes);
+            if isnumeric(c1) & (length(c1)==g.nGenes)
                 % numeric vector goes right through
                 v1all = c1;
             else
                 % identify from groups
                 c1 = g.IdentifyCells(c1);
-                v1all = trimmean(g.GeneExp(:,c1),34, '', 2);
+                if Prctile
+                    v1all = prctile(double(g.GeneExp(:,c1)),Prctile(1), 2);
+                else
+                    v1all = trimmean(double(g.GeneExp(:,c1)),34, '', 2);
+                end
                 
                 % if no second argument provided, it is the rest
                 if nargin<3 | isempty(c2)
@@ -2339,7 +2458,11 @@ classdef GeneSet
             else
                 % identify from groups and remove any from c1
                 c2 = setdiff(g.IdentifyCells(c2), c1);
-                v2all = trimmean(g.GeneExp(:,c2),34, '', 2);
+                if Prctile
+                    v2all = prctile(double(g.GeneExp(:,c2)),Prctile(2), 2);
+                else
+                    v2all = trimmean(double(g.GeneExp(:,c2)),34, '', 2);
+                end
             end
             
             
@@ -2394,419 +2517,6 @@ classdef GeneSet
             if nargout==0; clear h; end
         end
             
-        
-        function [g, Decisions] = DivisiveClustering(g, SplitClass, Params, Recurse)
-            % g = DivisiveClustering(SplitClass, Params) 
-            % Recursive program to do divise clustering of cells
-            %
-            % Those cells whose entry in g.Class exactly match SplitClass will be
-            % split into two groups by calling Params.SplitFn(). Then g.Class will
-            % be updated for these cells, appending ".Gene1" and ".Gene2"
-            % where Gene1 and Gene2 stand for the genes of highest choice
-            % probability for the two subsets.
-            %
-            % After this, DivisiveClustering will be called recursively for
-            % these two subclasses.
-            %
-            % if you call with SplitClass empty or missing, it will wipe
-            % g.Class. So be careful!
-            %
-            % Params is a structure containing a field SplitFn saying which 
-            % split function to call, and other parameters that get passed
-            % to it. Use DefaultSplitParams to create default
-            %   
-            %
-            % returns g with Class added
-            % Second optional output Decisions is a structure array with
-            % one entry per split, containing:
-            %   w: 2 by nGenes array of weights with NaN for genes not considered
-            %   y: 2 by nCells array of class membership scores with NaN for cells not considered
-            %   ParentClass: string saying who was split
-            %   ChildClass1, ChildClass2: strings saying what it got split into
-            
-%             
-%             if nargin<3
-%                 DisplayGenes={};
-%             else
-%                 DisplayGenes = intersect(DisplayGenes, g.GeneName);
-%             end
-
-            if nargin<3 
-                Params = DefaultSplitParams;
-            end
-            
-            if nargin<4
-                Recurse=0;
-            end
-            
-            
-            g.GeneExp = double(g.GeneExp); % because MATLAB
-            
-            % is this the top-level call? if so, wipe existing 
-            if Recurse==0
-                SplitClass = '';
-                MyCells = 1:g.nCells;
-                g.Class = cell(g.nCells,1);
-                g.Class(1:g.nCells) = cellstr(SplitClass);
-            else
-                MyCells = find(strcmp(SplitClass, g.Class));
-            end
-            
-            fprintf('Splitting %s\n', SplitClass);
-            
-            
-
-            [Clu, Suffix1, Suffix2, Decision] = Params.SplitFn(g,MyCells, Params, SplitClass,0);
-            %[Clu, Suffix1, Suffix2, Decision] = g.Split(MyCells, Params, SplitClass,0);
-            %[Clu, Suffix1, Suffix2, Decision] = SplitLP(g,MyCells, Params, SplitClass,0);
-            Decision.ParentClass = SplitClass;
-               
-            Name1 = [SplitClass, '.', Suffix1];
-            Name2 = [SplitClass, '.', Suffix2];
-            Decision.ChildClass1 = Name1;
-            Decision.ChildClass2 = Name2;
-
-            if ~isempty(Clu)
-                % rename split classes
-                
-                c1 = find(Clu==1);
-                c2 = find(Clu==2);
-                g.Class(MyCells(c1)) = cellstr(Name1);
-                g.Class(MyCells(c2)) = cellstr(Name2);
-                
-                % now recusively split each one again
-                if Decision.UserResponse~='f'
-                    [g, Decision1] = g.DivisiveClustering(Name1, Params, 1);
-                    [g, Decision2] = g.DivisiveClustering(Name2, Params, 1);
-                else
-                    Decision1 = [];
-                    Decision2 = [];
-                end
-
-                % find genes most strongly expressed in each half
-%                 ExpRat = (mean(g1.GeneExp,2)+eps)./(mean(g2.GeneExp,2)+eps);
-%                 [dummy, TopFor1] = max(ExpRat);
-%                 [dummy, TopFor2] = min(ExpRat);
-%                 
-%                 Suffix1 = g.IDsToNames(TopFor1);
-%                 Suffix2 = g.IDsToNames(TopFor2);
-                Decisions = [Decision, Decision1, Decision2];
-            else
-                Decisions = Decision;
-            end
-            
-            if Recurse==0
-                % sort by class name, only if top iteration
-                [~, order] = sort(g.Class);
-                g = g.CellSubset(order);
-            end
-            
-        end
-        
-        function [Clu, Suffix1, Suffix2, Decision, BestScore] = Split(gAll, TheseCells, DisplayGenes, PlotTitle, ScoreOnly)
-            % split into an L shape
-            % output 1 or 2 for each cluster, 0 for neither
-            % output [] not to split
-            % optional outputs Suffix1 and Suffix2 are for saying what to
-            % call them (used in divisive hierarchical clustering).
-            % Decision is a structure with fields:
-            %   w: 2 x gAll.nGenes array of weights
-            %   y: gAll.nCells array of scores
-            %   they will be NaN for genes or cells that were not
-            %   considered.
-            %
-            % FinalScore is the score of the chosen split ()
-            
-            if nargin<2 | isempty(TheseCells)
-                g = gAll;
-            else
-                g = gAll.CellSubset(TheseCells);
-            end
-            
-            if nargin<3; DisplayGenes = []; end
-            if nargin<4; PlotTitle = []; end
-            if nargin<5; ScoreOnly = 1; end
-
-            
-            % first find VectorLength most bimodal genes
-            VectorLength = 100;
-            nStarts = VectorLength;
-            alpha = 0.05;
-            %alpha = 10;
-            
-            beta = 1/g.nCells;
-            p=2;
-            d=2;
-            b=1/d;
-            Jitter = .25;
-            Thresh = ((b+1)/2).^p; % corresponds to x=1, y=0
-            Thresh = -inf; % CLASSIFY EVERYTHING!!!
-            
-            SkipThresh = 1e-3;
-
-            nTops = 60; % how many to show in colored words
-
-            
-            
-            pow = 2;
-
-
-            
-            fprintf('Finding %d most bimodal...', VectorLength);
-            Bim = g.Bimodality;
-            [BimSorted, BimOrder] = sort(Bim, 'descend');
-            gBim = g.GeneSubset(BimOrder(1:VectorLength));
-            fprintf('Done\n');
-            
-            
-            %now do divisive clustering on them
-            X = gBim.ScaleGene(1).GeneExp;
-
-            % parameters
-            
-            % activation functions etc.
-            f = @(v) bsxfun(@rdivide,b+v, 1+sum(v,1)).^p;
-            Score = @(y) -sum(sum(y)) + beta*sum(sum(y,2).^2)/2;
-            Penscore = @(w) Score(f(w*X)) + alpha*sum(w(:).^2)/2; 
-            Opt = @(w) OptFn(w,X,p,b,alpha, beta);
-            Options = optimoptions('fmincon', 'Algorithm', 'sqp', 'GradObj', 'on', 'display', 'notify');%, 'Display', 'iter');%, 'DerivativeCheck', 'on');
-
-            % now do multiple starts of optimization, from each gene
-            Scores = zeros(nStarts,1);
-            wStore = zeros(d,VectorLength,nStarts);
-            
-            parfor i=1:nStarts
-%                 w0=zeros(d,nBims);
-%                 w0(1,i) = 1;
-                w0 = accumarray([1 i], 1, [d VectorLength]);
-                w = fmincon(Opt, w0, [], [], [], [], zeros(size(w0)), [], [], Options);
-            
-                Scores(i) = Penscore(w);
-                
-                wStore(:,:,i) = w;
-                
-                if ~ScoreOnly
-                    fprintf('%s score %f\n', gBim.IDsToNames(i), Scores(i));
-                end
-            end
-            
-            % this is a bit of a hack to make it return only the best score
-            if ScoreOnly
-                BestScore = min(Scores);
-                Clu = []; Suffix1 = []; Suffix2 = []; Decision = [];
-                return;
-            end
-                
-            
-            % now go through them in order, and see if user wants to split
-            [ScoreSorted, ScoreOrder] = sort(Scores, 'ascend');
-            LastScore = inf;
-            while 1
-                for i=1:VectorLength
-                    seed = ScoreOrder(i);
-
-                    % only consider this if different score to previous (to
-                    % avoid seeing multiple of the same local maximum)
-                    if i>1 & abs(ScoreSorted(i)-LastScore)<SkipThresh; 
-                        fprintf('Skipping %s, Score %f\n', gBim.IDsToNames(seed), ScoreSorted(i));
-                        continue; 
-                    end
-                    LastScore = ScoreSorted(i);
-
-                    
-                    w = wStore(:,:,seed);
-                    
-                    y = f(w*X);
-                    Cells1 = find(max(y,[],1)>Thresh & y(1,:)>=y(2,:));
-                    Cells2 = find(max(y,[],1)>Thresh & y(1,:)<y(2,:));
-                    Cells0 = find(max(y,[],1)<=Thresh);
-                    n1 = length(Cells1);
-                    n2 = length(Cells2);
-                    n0 = length(Cells0);
-                    
-                    if isempty(Cells0)
-                        ColorOrder = 'br';
-                    else
-                        ColorOrder = 'kbr';
-                    end
-
-                    Clu = zeros(g.nCells,1);
-                    Clu(Cells1) = 1;
-                    Clu(Cells2) = 2;
-
-
-                    % plot weights of all genes
-                    figure(1); clf; subplot(2,1,1);
-                    set(gcf, 'Name', PlotTitle );
-                    plot(1:VectorLength, w(1,:), 'b.');
-                    plot(1:VectorLength, w(2,:), 'r.');
-                    set(text(1:VectorLength, w(1,:), gBim.GeneName), 'color', 'b', 'Interpreter', 'none');
-                    set(text(1:VectorLength, w(2,:), gBim.GeneName), 'color', 'r', 'Interpreter', 'none');
-                    set(gcf, 'Name', PlotTitle);
-                    xlabel('Bimodality order');
-                    ylabel('Weight');
-                    ylim([0 max(w(:))]*1.1);
-
-                    subplot(2,1,2); cla; hold on
-                    wX = w*X;
-                    plot(wX(1,Cells1) + rand(1,n1)*Jitter, wX(2,Cells1) +rand(1,n1)*Jitter, 'b.');
-                    plot(wX(1,Cells2) + rand(1,n2)*Jitter, wX(2,Cells2) +rand(1,n2)*Jitter, 'r.');
-                    plot(wX(1,Cells0) + rand(1,n0)*Jitter, wX(2,Cells0) +rand(1,n0)*Jitter, 'k.');
-                    xlabel('Team 1 sum');
-                    ylabel('Team 2 sum')
-                    
-                    figure(2); clf
-                    % plotmatrix of genes with scores more than 0.1
-                    [Wtsorted1 WtOrder1] = sort(w(1,:),'descend');
-                    nShow1 = min(13,max(find(Wtsorted1>.1)));
-                    [Wtsorted2, WtOrder2] = sort(w(2,:),'descend');
-                    nShow2 = min(13,max(find(Wtsorted2>.1)));
-                    if nShow1>0 & nShow2>0
-                        gBim.PlotMatrix({WtOrder1(1:nShow1), WtOrder2(1:nShow2)},Clu,0,ColorOrder,5);
-                        set(gcf, 'Name', [PlotTitle ': Splitting Genes']);
-                    end
-                    
-                    % now with colors determined by BackSpin
-%                     figure(3); clf
-%                     gBim.PlotMatrix({WtOrder1(1:nShow1), WtOrder2(1:nShow2)},gBim.CellInfo.level2class,0,colorcube(16),'.',5);
-%                     set(gcf, 'Name', PlotTitle);
-%                     
-%                     figure(4); clf
-%                     GeneOrder = BestDiscriminants(g,Clu);
-%                     g.PlotMatrix(GeneOrder(1:8),Clu,0,ColorOrder,'.',5);
-%                     set(gcf, 'Name', [PlotTitle ': Best Discriminants']);
-
-                    % show genes with best Choice probability in group 1 vs
-                    % group 2
-                    figure(4); clf
-                    set(gcf, 'Name', PlotTitle );
-                    cp21 = g.ChoiceProb(Cells2, Cells1);
-                    Color = abs(cp21-.5).^pow * 2^(pow-1) .*sign(cp21-.5) + .5;
-
-                    [~, Cporder] = sort(abs(cp21-.5), 'descend');
-                    TopGenes = Cporder(1:nTops);
-
-                    subplot(3,2,1);
-                    ColoredWords(g.GeneName(TopGenes), Color(TopGenes), 6, BlueWhiteRed(200));
-                    xlim([.4, 6.6]);
-                    title('Group 2 vs Group 1');
-                    
-                    Favs = g.NamesToIDs(intersect(g.GeneName,FavoriteGenes));
-                    subplot(3,2,2);
-                    ColoredWords(g.GeneName(Favs), Color(Favs), 6, BlueWhiteRed(200));
-                    xlim([.4, 6.6]);
-                    title('Group 2 vs Group 1');
-                    
-                    % now find best choice prob of group 1 vs the rest
-                    cp1 = gAll.ChoiceProb(TheseCells(Cells1));
-                    Color = abs(cp1-.5).^pow * 2^(pow-1) .*sign(cp1-.5) + .5;
-                    [~, Cporder1] = sort(abs(cp1-.5), 'descend');
-                    TopGenes1 = Cporder1(1:nTops);
-                    
-                    subplot(3,2,3);
-                    ColoredWords(g.GeneName(TopGenes1), Color(TopGenes1), 6, BlueWhiteRed(200));
-                    xlim([.4, 6.6]);
-                    title('Group 1 vs the rest');
-                    
-                    subplot(3,2,4);
-                    ColoredWords(g.GeneName(Favs), Color(Favs), 6, BlueWhiteRed(200));
-                    xlim([.4, 6.6]);
-                    title('Group 1 vs the rest');
-
-                    % now find best choice prob of group 2 vs the rest
-                    cp2 = gAll.ChoiceProb(TheseCells(Cells2));
-                    Color = abs(cp2-.5).^pow * 2^(pow-1) .*sign(cp2-.5) + .5;
-                    [~, Cporder2] = sort(abs(cp2-.5), 'descend');
-                    TopGenes2 = Cporder2(1:nTops);
-                    
-                    subplot(3,2,5);
-                    ColoredWords(g.GeneName(TopGenes2), Color(TopGenes2), 6, BlueWhiteRed(200));
-                    xlim([.4, 6.6]);
-                    title('Group 2 vs the rest');
-                    
-                    subplot(3,2,6);
-                    ColoredWords(g.GeneName(Favs), Color(Favs), 6, BlueWhiteRed(200));
-                    xlim([.4, 6.6]);
-                    title('Group 2 vs the rest');
-                    
-
-
-                    if ~isempty(DisplayGenes)
-                        figure(5); clf
-                        g.PlotMatrix(DisplayGenes,Clu,0,ColorOrder,'.',5);
-                        set(gcf, 'Name', [PlotTitle ': Old Favorite Genes']);
-                    end
-                    
-%                     figure(3); clf
-                    
-                    
-%                     xmax=max(w(1,:)*X);
-%                     plot([1 xmax], [1 xmax]*(Theta^-1 - 1))
-    %                 for j=1:d
-    %                     Names = cellstr(gBim.IDsToNames(find(w(j,:)>.1)));
-    %                     for k=1:length(Names) fprintf('%s ', Names{k}); end;
-    %                     if j<d; fprintf('\n vs. '); else fprintf('\n'); end;
-    %                 end
-                    fprintf('Seed %s, Score %f = %f + %f + %f\n',  gBim.IDsToNames(seed), ScoreSorted(i), -sum(sum(y)), beta*sum(sum(y,2).^2)/2, alpha*sum(w(:).^2)/2); 
-                    
-                    Response = input('(s)plit; (a)ll again; (q)uit don''t split; return to see next: ', 's');
-                    if Response=='k'
-                        keyboard;
-                        continue;
-                    end
-                    if length(Response)>0 break; end
-                end
-                if Response=='s' | Response=='q' | Response=='2' | Response=='1' ; break; end
-            end
-            
-            if Response=='q' 
-                Clu = [];
-            end
-
-
-if 0            
-            figure(2); print('-dpdf', ['PDFs\Scatter ' PlotTitle '.pdf']);
-            figure(4); print('-dpdf', ['PDFs\ColorGenes ' PlotTitle '.pdf']);
-end
-            
-            % choose subgroup names
-            [~,Order1] = sort(cp1, 'descend');
-            [~,Order2] = sort(cp2, 'descend');
-            Pos = find(Order1~=Order2, 1, 'first');
-            if isempty(Pos); Pos=1; end; % if Order1 and Order2 are completely equal, give up
-            NameGene1 = Order1(Pos);
-            NameGene2 = Order2(Pos);
-
-            
-            if Response=='2'
-                Suffix1 = g.IDsToNames(NameGene2);
-                Suffix2 = g.IDsToNames(NameGene1);
-                Clu=(3-Clu).*(Clu>0); % swap clusters 1 and 2, leave 0
-            else                
-                Suffix1 = g.IDsToNames(NameGene1);
-                Suffix2 = g.IDsToNames(NameGene2);
-            end
-            
-            Decision.w = nan(2, gAll.nGenes);
-            Decision.w(:, BimOrder(1:VectorLength)) = w;
-            Decision.y = nan(2, g.nCells);
-            Decision.y(:, TheseCells) = y;
-            Decision.Score = ScoreSorted(i);
-            Decision.UserResponse = Response;
-        end
-
-        
-        function Scores = SplitNull(g, n)
-            % Scores = SplitNull(g, n)
-            %
-            % return a null distribution of best scores from splitting
-            % n random permutations of a geneset g
-            
-            Scores = zeros(n,1);
-            for i=1:n
-                [~,~,~,~,Scores(i)] = Split(g.Randomize(), 1:g.nCells, [], [], 1);
-            end
-        end
         
         function [w, Objective, Errors] = L1Classify(g, wMax, C1, C0);
             % w = L1Classify(g, wMax, C1, C0);
@@ -3006,7 +2716,7 @@ end
         function gTrunc = TruncateHierarchy(g, nLevels)
             % gTrunc = TruncateHierarchy(nLevels)
             %
-            % Truncates a hierarchy to at most nLevels levels deep
+            % Truncates the Class hierarchy to at most nLevels levels deep
             
             gTrunc = g;
             for i=1:g.nCells
@@ -3411,6 +3121,109 @@ end
             
         end
             
+        function [dprime, likrat, bars] =ClassSeparation(g, Class1, Class2, regN, regD, KeepBestGenes)
+            % dprime=ClassSeparation(g, Class1, Class2, regN, regD, KeepBestGenes)
+            % computes a measure of separation by comparing the
+            % cross-validated log-likelihood-ratio between class means.
+            % Uses random 2-fold cross-validation, produces a bar chart
+            % or returns a dprime statistic if output arg given
+            %
+            % regN (default 1) and regD (default 1) regularize the
+            % numerator and denominator of the class mean on training set
+            % KeepBestGenes: use this many genes. If 0, determine best
+            % number by cross-validation. If neg or missing, use all
+            %
+            % if no output or at least 3 outputs does a bar chart, handle
+            % return as third output
+            %
+            % NOTE: You probably want to run ScaleCell(1) before doing this
+            
+            r=2; %negbin parameter
+            nFold = 10; % crossval folds
+
+            if nargin<4; regN=1; end
+            if nargin<5; regD=1; end
+            if nargin<6; KeepBestGenes = -1; end
+            KeepBestGenes = min(KeepBestGenes,g.nGenes);
+            
+            Cells1 = startsWith(g.Class, Class1);
+            Cells2 = startsWith(g.Class, Class2);
+            
+            x = g.GeneExp(:,[find(Cells1);find(Cells2)]);
+            cl = [false(sum(Cells1),1); true(sum(Cells2),1)];
+            [~, nC] = size(x);
+            
+            cvp = cvpartition(nC, 'kfold', nFold);
+            
+            lSame = zeros(size(x));
+            lOther = zeros(size(x));
+            
+            dl = zeros(nC,1); % difference between likelihood for c1 and c2
+            
+            for i=1:nFold
+                Train1 = ~cl & cvp.training(i);
+                Train2 = cl & cvp.training(i);
+                TrainBoth = cvp.training(i);
+                Test1 = ~cl & cvp.test(i);
+                Test2 = cl & cvp.test(i);
+%                 TestBoth = cvp.test(i);
+            
+                mu1 = (regN + sum(x(:,Train1),2))./(regD + sum(Train1));
+                mu2 = (regN + sum(x(:,Train2),2))./(regD + sum(Train2));
+%                 muBoth = (regN + sum(x(:,TrainBoth),2))./(regD + sum(TrainBoth));
+
+                p1 = mu1./(mu1+r);
+                p2 = mu2./(mu2+r);
+%                 pBoth = muBoth./(muBoth+r);
+                
+                lSame(:,Test1) = log(p1) .* x(:,Test1) + r*log(1-p1);
+                lSame(:,Test2) = log(p2) .* x(:,Test2) + r*log(1-p2);
+                lOther(:,Test1) = log(p2) .* x(:,Test1) + r*log(1-p2);
+                lOther(:,Test2) = log(p1) .* x(:,Test2) + r*log(1-p1);
+%                 lBoth(:,TestBoth) = log(p1) .* x(:,TestBoth) + r*log(1-p1);
+                
+                if KeepBestGenes>=0
+                    ltSame = zeros(size(x));
+                    ltOther = zeros(size(x));
+                    ltBoth = zeros(size(x));
+                    ltSame(:,Train1) = log(p1) .* x(:,Train1) + r*log(1-p1);
+                    ltSame(:,Train2) = log(p2) .* x(:,Train2) + r*log(1-p2);
+                    ltOther(:,Train1) = log(p2) .* x(:,Train1) + r*log(1-p2);
+                    ltOther(:,Train2) = log(p1) .* x(:,Train2) + r*log(1-p1);
+%                     ltBoth(:,TrainBoth) = log(pBoth) .* x(:,TrainBoth) + r*log(1-p1);
+                    
+                    
+                    GeneScore = sum(ltSame,2)-sum(ltOther,2);
+%                     GeneScore = sum(ltSame,2)-sum(ltBoth,2);
+                    [sortScore, GeneOrder] = sort(GeneScore, 'descend');
+                    kg = GeneOrder(1:KeepBestGenes);
+                else
+                    kg = 1:g.nGenes;
+                end
+                    
+                dl(Test1) = sum(lSame(kg,Test1)-lOther(kg,Test1),1);
+                dl(Test2) = sum(lOther(kg,Test2)-lSame(kg,Test2),1);
+            end
+            
+            dl1 = dl(~cl);
+            dl2 = dl(cl);
+            
+
+            dprime=(mean(dl1) - mean(dl2))/sqrt(var(dl1)/2+var(dl2)/2);
+            likrat = mean(sum(lSame(kg,:)-lOther(kg,:),1));
+%             likrat = mean(sum(lSame(kg,:)-lBoth(kg,:),1));
+            
+            if nargout<1 | nargout>=3
+                xr = min([dl1; dl2]) + (0:1/12:1)*(max([dl1; dl2])-min([dl1; dl2]));
+                counts1 = histc(dl1,xr);
+                counts2 = histc(dl2,xr);
+                bars = bar(xr,[counts1, counts2], 'stacked');
+                legend(Class1, Class2)
+                title(sprintf('d'' = %f', dprime));
+            end
+        end
+            
+            
 
                 
         function [d, m, p] = RelativeExpression(g, Group1, Group2, reg)
@@ -3519,20 +3332,26 @@ end
             h.GeneExp = double(g.GeneExp>=Threshold);
         end
         
-        function h = ComputetSNE(g, WhichGenes, nDim);
-            % h = tSNE(nDim);
+        function h = ComputetSNE(g, WhichGenes, Scale, MaxIter, nDim, r, Animate)
+            % h = ComputetSNE(WhichGenes, nDim, Scale, r, Animate);
             % does a nDim-dimensional tSNE plot using the external drtoolbox
             % and saves the output in the tSNE variable
-            % default dim = 2
+            % Scale: divide expression by this much (default 1)
+            % nDim: num dimensions (default = 2)
+            % r: negbin parameter (default = 2)
+            % Animate: binary (default = 0);
             
-            if nargin<3
-                nDim =2;
-            end
+            if nargin<2 || isempty(WhichGenes); WhichGenes=g.FavGenes; end;
+            if nargin<3; Scale = 1; end            
+            if nargin<4; MaxIter = 500; end            
+            if nargin<5; nDim =2; end            
+            if nargin<6; r =2; end
+            if nargin<7; Animate=1; end
             
             Reg = 0.1;
-            r = 2;
             
-            x = g.Exp(WhichGenes,1:g.nCells) + Reg; % expression of active genes: nActive by nC
+            x = g.Exp(WhichGenes,1:g.nCells)/Scale + Reg; % expression of active genes: nActive by nC
+%             x = single(x);
             p = x./(x + r); % negbin parameter:  nActive by nC
             L = bsxfun(@plus, x'*log(p), sum(r*log(1-p), 1)); % L(i,j): log likelihood of cell i in cluster defined by cell j
 
@@ -3563,19 +3382,128 @@ end
             
             
             
-            figure(2389075); clf;
             [~, ~, ClassNum] = unique(g.Class, 'stable');
-            InitialSolution = [zscore(ClassNum(:)), randn(g.nCells,nDim-1)*1e-4];
+            %InitialSolution = [zscore(ClassNum(:)), randn(g.nCells,nDim-1)*1e-4];
             th = 2*pi*(ClassNum(:) - min(ClassNum))/(max(ClassNum) - min(ClassNum));
-            InitialSolution = [cos(th), sin(th)];
+            if nDim==2
+                InitialSolution = [cos(th), sin(th)];
+            else
+                InitialSolution = [cos(th), sin(th), th/2/pi];
+            end
             h = g;
-            h.tSNE = tsne_p(P, ClassNum, InitialSolution)';
-            
-            
+            if Animate
+                figure(2389075); clf;
+                h.tSNE = tsne_p(P, ClassNum, InitialSolution)';
+            else
+                h.tSNE = tsne_p(P, [], InitialSolution)';
+            end
 
 %             h = g;
 %             h.tSNE = compute_mapping(g.GeneExp', 'tSNE', nDim)';
         end
+        
+                
+        function [h,u] = ComputeUMAP(g, WhichGenes, nDim, r, varargin)
+            % h = ComputeUMAP(WhichGenes, nDim, r, UMAP ARGS);
+            % does a nDim-dimensional UMAP plot using the external run_umap
+            % and saves the output in the tSNE variable
+            % WhichGenes: use only these (default FavGenes)
+            % nDim: num dimensions (default = 2)
+            % r: negbin parameter (default = 2)
+            % remaining args passed to umap
+            % works by Euclidean distance of log(r+x)
+            
+            if nargin<2 || isempty(WhichGenes); WhichGenes=g.FavGenes; end;
+            if nargin<3 || isempty(nDim); nDim =2; end            
+            if nargin<4 || isempty(r); r =2; end
+
+            [~, ~, ClassNum] = unique(g.Class, 'stable');
+            th = 2*pi*(ClassNum(:) - min(ClassNum))/(max(ClassNum) - min(ClassNum));
+            if nDim==2
+                InitialSolution = [cos(th), sin(th)];
+            else
+                InitialSolution = [cos(th), sin(th), th/2/pi];
+            end
+
+            
+            x = g.Exp(WhichGenes,1:g.nCells); % expression of active genes: nActive by nC
+            xt = log(r + x./mean(x,1) * mean(x(:)));
+            h = g;
+            u = UMAP('init', InitialSolution, 'verbose', true, 'n_components', nDim, varargin{:}).fit(xt');
+            %u = UMAP('verbose', true, 'n_components', nDim, varargin{:}).fit(xt');
+            h.tSNE = u.embedding';
+%            h.tSNE = run_umap(x', 'init', InitialSolution)';
+        end
+        
+        function [h,u] = GeneUMAP(g, nDim, r, varargin)
+            % [h,u] = GeneUMAP(nDim, r, UMAP ARGS);
+            % does a nDim-dimensional UMAP plot using the external run_umap
+            % but with one point per GENE not per cell
+            % r: negbin parameter (default = 2)
+            % remaining args passed to umap
+            % works by Euclidean distance of log(r+x)
+            % stores output in h.GeneInfo.UMAP[nGenes by nDims] also
+            % returns optional umap object u
+            %
+            % You might want to start by running GoodExpressers to filter
+            % out genes hardly expressed
+            %
+            % The names of g.FavGenes are plotted 
+            % all genes have their name as a data tip (select the data tip
+            % icon then click on the point to see name)
+            
+           if nargin<2 || isempty(nDim); nDim =2; end
+           if nargin<3 || isempty(r); r = 2; end
+           
+           h=g;
+%            if isempty(h.GeneCorrels)
+%                 z = zscore(h.GeneExp,1,2);
+%                 h.GeneCorrels = z*z'/h.nCells;
+%                 h.GeneCorrels(~isfinite(h.GeneCorrels))=0;
+%            end
+%             
+            xt = log(r + h.ScaleGene(1).GeneExp); % expression of active genes: nActive by nC
+            
+            u = UMAP('verbose', true, 'n_components', nDim, varargin{:}).fit(xt);
+            %u = UMAP('verbose', true, 'n_components', nDim, varargin{:}).fit(xt');
+            h.GeneInfo.UMAP = u.embedding';
+%            h.tSNE = run_umap(x', 'init', InitialSolution)';
+
+            cla;
+            handle = plot(h.GeneInfo.UMAP(1,:), h.GeneInfo.UMAP(2,:), '.');
+            % make data tip 
+            handle.DataTipTemplate.DataTipRows = dataTipTextRow('Gene', h.GeneName)
+            
+            % plot name of favorite genes
+            IDs = h.NamesToIDs(h.FavGenes);
+            text(h.GeneInfo.UMAP(1,IDs), h.GeneInfo.UMAP(2,IDs), h.GeneName(IDs));
+            
+            % now do a Rodriguez-Laio to find local peaks
+            dist = ClosestBigger(-log(u.graph), sum(u.graph));
+            IDs = find(dist>0);
+            text(h.GeneInfo.UMAP(1,IDs), h.GeneInfo.UMAP(2,IDs), h.GeneName(IDs), 'color', 'r');
+            
+            
+            
+        end
+
+        
+        function [Sym, Clr] = ClassSymbols(g)
+            % [Sym, Clr] = g.ClassSymbols
+            %
+            % return some symbols and colors for plotting classes
+            
+            [uGrpNm, ~, uGrpInd] = unique(g.Class, 'stable');
+            nGroups = length(uGrpNm);
+
+            % make symbols alternating colors and shapes
+            Sym0 = cellstr(repmat('o+*hxsd^<v>p', [1 ceil(nGroups/12)])');
+            Clr0 = num2cell(HsvNotYellow(ceil(nGroups*1.2)), 2); % turn down green so can see yellow, 1.2 so ends not identical
+
+            Sym = containers.Map(uGrpNm, Sym0(1:nGroups));
+            Clr = containers.Map(uGrpNm, Clr0(1:nGroups));
+        end
+            
         
         function BrushableScatter(g, x, Size, Sym, Clr, Size0)
             % h = BrushableScatter(g, x, Size, Sym, Clr, Size0)
@@ -3588,14 +3516,14 @@ end
             %
             % If Sym and Clr are provided, then they are arrays to look up
             % the appropriate color and size for each symbol - use
-            % containers.map
+            % containers.map (or call g.ClassSymbols)
             % 
             % Size0 says what to do with points of Size==0; if Size0 is 0,
             % they won't be plotted, otherwise they are points of this size
             
             
-            if nargin<3; Size = 10; end
-            if nargin<6; Size0= 2; end
+            if nargin<3 || isempty(Size); Size = 10; end
+            if nargin<6 || isempty(Size0); Size0= 2; end
             
             if length(Size)==1
                 Size = Size * ones(g.nCells, 1);
@@ -3615,12 +3543,13 @@ end
             nGroups = length(uGrpNm);
             
             if nargin<4 | isempty(Sym) | isempty(Clr)
+                [Sym, Clr] = g.ClassSymbols();
                 % make symbols alternating colors and shapes
-                Sym0 = cellstr(repmat('o+*hxsd^<v>p', [1 ceil(nGroups/12)])');
-                Clr0 = num2cell(HsvNotYellow(ceil(nGroups*1.2)), 2); % turn down green so can see yellow, 1.2 so ends not identical
-                
-                Sym = containers.Map(uGrpNm, Sym0(1:nGroups));
-                Clr = containers.Map(uGrpNm, Clr0(1:nGroups));
+%                 Sym0 = cellstr(repmat('o+*hxsd^<v>p', [1 ceil(nGroups/12)])');
+%                 Clr0 = num2cell(HsvNotYellow(ceil(nGroups*1.2)), 2); % turn down green so can see yellow, 1.2 so ends not identical
+%                 
+%                 Sym = containers.Map(uGrpNm, Sym0(1:nGroups));
+%                 Clr = containers.Map(uGrpNm, Clr0(1:nGroups));
             end
 
             % plot it one group at a time
@@ -3641,21 +3570,26 @@ end
                 MySize = Size(pts);
                 
                 if ThreeD
-%                        h = plot3(x(pts,1), x(pts, 2), x(pts, 3), Sym(i), 'Color', Clr(i,:));
-                        h(i) = plot3(x(pts,1), x(pts, 2), x(pts, 3), Sym(gn), 'Color', Clr(gn));
+                    %h = plot3(x(pts,1), x(pts, 2), x(pts, 3), Sym(i), 'Color', Clr(i,:));
+                    %h(i) = plot3(x(pts,1), x(pts, 2), x(pts, 3), Sym(gn), 'Color', Clr(gn));
+                    %plot3(x(pts,1), x(pts, 2), x(pts, 3), Sym(gn), 'Color', Clr(gn));
+                    h(i) = scatter3(x(pts,1), x(pts, 2), x(pts, 3), MySize, Clr(gn), Sym(gn));
+                    if Size0>0
+                        hh(i) = scatter3(x(pts0,1), x(pts0,2), x(pts0, 3),Size0, Clr(gn), '.');
+                        set(hh(i), 'UserData', g.CellName(pts0));
+                    end
+
                 else
-                        h(i) = scatter(x(pts,1), x(pts,2), MySize, Clr(gn), Sym(gn));
-                        if Size0>0
-                            hh(i) = scatter(x(pts0,1), x(pts0,2), Size0, Clr(gn), '.');
-                            set(hh(i), 'UserData', g.CellName(pts0));
-                        end
-%                     else
-%                         h = plot(g.tSNE(1,pts), g.tSNE(2,pts), Sym(i), 'Color', Clr(i,:));
+                    h(i) = scatter(x(pts,1), x(pts,2), MySize, Clr(gn), Sym(gn));
+                    if Size0>0
+                        hh(i) = scatter(x(pts0,1), x(pts0,2), Size0, Clr(gn), '.');
+                        set(hh(i), 'UserData', g.CellName(pts0));
+                    end
                 end
                 set(h(i), 'UserData', g.CellName(pts));
             end
             
-            if nGroups>1
+            if nGroups>1 %& ~ThreeD
                 legend(flipud(h(:)), flipud(uGrpNm(:)));
             end
             
@@ -3664,12 +3598,149 @@ end
             end
         end
         
-        function tSNEPlot(g, Gene, SizeMult, SizeOffset, LogAdd, Sym, Clr, Size0)
+        function GeneList = NBChooseGenes(g, scaleDown, scoreThresh, medThresh, fuThresh, nz, r)
+            % find genes which are best fit by a class mean than an overall mean
+            %
+            % scaleDown: divide expression by this much first (default 500)
+            %
+            % scoreThresh: Needs score to be this many (bits) for best 
+            % class (default 1)
+            %
+            % medThresh: needs median of top class to be at least this
+            % (after dividing). Default 1
+            % 
+            % fuThresh: needs this fraction to have near-zero expression
+            % (default 1/3)
+            % 
+            % nz: scaled expression less than this counts as near-zero
+            % (default .2)
+            %
+            % r: negbin parameter (default 2)
+            
+            
+            if nargin<2 || isempty(scaleDown); scaleDown = 500; end
+            if nargin<3 || isempty(scoreThresh); scoreThresh = 1; end
+            if nargin<4 || isempty(medThresh); medThresh = 1; end
+            if nargin<5 || isempty(fuThresh); fuThresh = 1/3; end
+            if nargin<6 || isempty(nz); nz = .2; end
+            if nargin<7 || isempty(r); r = 2; end
+
+            % x: scaled expression
+            x = g.GeneExp/scaleDown;
+
+            % compute class means and medians
+            uc = unique(g.Class);
+            nc = length(uc);
+            ClassMeans = zeros(g.nGenes, nc);
+            ClassMedians = zeros(g.nGenes, nc);
+            for c=1:nc
+                my = strcmp(uc{c}, g.Class);
+                ClassMeans(:,c) = mean(x(:,my),2);
+                ClassMedians(:,c) = median(x(:,my),2);
+            end
+
+            % overall means 
+            OverallMeans = mean(x,2);
+
+            nUnexp = sum(ClassMedians<nz,2);
+            [HighestMedian, HighestMedianClass] = max(ClassMedians,[],2);
+
+            % compute NB scores for best class
+
+            dL = zeros(g.nGenes, nc);
+
+            lmu0 = log(OverallMeans); % to save recalculating each time
+            lmu0r = log(OverallMeans + r); 
+            for c=1:nc
+                mu = ClassMeans(:,c);
+                dL(:,c) = mu.*(log(mu)-lmu0) + (mu + r).*(lmu0r - log(mu+r));
+            end
+
+            % find best for each cell
+            [Score, bestClass] = max(dL/log(2),[],2); % convert to bits
+            gl0 = find(Score>=scoreThresh & HighestMedian>=1 & nUnexp>=nc*fuThresh);
+            [~,order] = sort(Score(gl0) ,'d', 'missingplacement', 'last');
+            GeneList = g.GeneName(gl0(order));   
+            
+        end
+        
+        function ShowCentersOfMass(g, Genes, Cells)
+            % ShowCentersOfMass(Genes, Cells)
+            % selected graphics window should be a tSNE plot
+            % adds the centers of mass for selected Genes in selected Cells
+            % 
+            % Genes: which genes to show. Default g.FavGenes. If a single
+            % number, shows that many with top distance from center of
+            % mass, normalized by 
+            %
+            % Cells: which cells to compute for. Default, all in window
+            
+            if nargin<2 || isempty(Genes); Genes = g.FavGenes; end
+            if nargin<3 || isempty(Cells)
+                % get cells within axis limits
+                ax = axis;
+                Cells = all(g.tSNE>=ax(1:2:end)' &  g.tSNE<=ax(2:2:end)');
+            end
+            Cells = g.IdentifyCells(Cells);
+            
+            if length(Genes)==1 & isnumeric(Genes)
+                % find top genes by dividing CoM by variance
+                KeepTop = Genes;
+                Genes = find(any(g.GeneExp(:,Cells)>0,2));
+%                 gStd = std(log(1+g.GeneExp(:,Cells)),[],2);
+%                 [~,order] = sort(gStd,'d');
+%                 Genes = order(1:Genes);
+            else 
+                KeepTop = 0;
+            end
+           
+            persistent PointHandles TextHandles
+            
+            try delete(PointHandles); PointHandles=[]; end
+            try delete(TextHandles); TextHandles=[]; end
+            
+            %x = log(1+g.Exp(Genes,Cells));
+            x = g.Exp(Genes, Cells);
+            cmGene = double(x*g.tSNE(:,Cells)' ./ sum(x,2)); 
+            cmAll = double(mean(g.tSNE(:,Cells),2));
+            
+            if KeepTop>0
+                % if gene expression was random, MS distance from global
+                % CoM would be proportional to variance of normalized
+                % expression (i think)
+                gVar = var(x./sum(x,2),[],2);
+                NormDist = sum((cmGene - cmAll').^2,2)./gVar;
+                [~, order] = sort(NormDist, 'd');
+                Genes = Genes(order(1:KeepTop));
+                cmGene = cmGene(order(1:KeepTop),:);
+            end
+            
+            ho = ishold; hold on;
+            if size(cmGene,2)==2
+                PointHandles = plot(cmGene(:,1), cmGene(:,2), 'k.');
+                PointHandles = [PointHandles(:); ...
+                    plot(cmAll(1), cmAll(2), 'ko', 'markersize', 10, 'MarkerFaceColor', 'k')];
+                TextHandles = text(cmGene(:,1), cmGene(:,2), g.IDsToNames(Genes));
+            else
+                PointHandles = plot3(cmGene(:,1), cmGene(:,2), cmGene(:,3),'k.');
+                PointHandles = [PointHandles(:); ...
+                    plot3(cmAll(1), cmAll(2), cmAll(3),'ko', 'markersize', 10, 'MarkerFaceColor', 'k')];
+                TextHandles = text(cmGene(:,1), cmGene(:,2), cmGene(:,3),g.IDsToNames(Genes));
+            end
+            
+            
+        end
+        
+        function Selected = tSNEPlot(g, Gene, SizeMult, SizeOffset, LogAdd, Sym, Clr, Size0)
             % tSNEPlot(Gene, SizeMult, SizeOffset, LogAdd, Sym, Clr, Size0)
             % plots the tSNE analysis - first call ComputetSNE
             % 
             % optional argument plots marker size as 
             % SizeOffset+SizeMult*(log(LogAdd+ Exp) - log(LogAdd))
+            % SizeMult: default 15
+            % SizeOffset: default 0
+            % LogAdd: default 2
+            % Size0: default SizeMult
             % zeros plotted as Size0 (default 0 means not plotted)
             % if Gene is cell array: will plot all of them in turn
             % if it is blank, plot all at size Size0
@@ -3682,17 +3753,30 @@ end
             if nargin<5 | isempty(LogAdd); LogAdd = 2; end
             if nargin<6; Sym = []; end
             if nargin<7; Clr = []; end;
-            if nargin<8 | isempty(Size0); Size0 = SizeMult; end;
+            if nargin<8 | isempty(Size0); Size0 = 1; end;
             
             if isstr(Gene) & ~isempty(Gene) & Gene(end)=='*'
                 Gene = g.NameStartsWith(Gene(1:end-1));
             end
             
             if iscell(Gene) 
+                Selected = {};
                 for i=1:length(Gene)
                     cla;
                     g.tSNEPlot(Gene{i},SizeMult, SizeOffset, LogAdd, Sym, Clr, Size0);
-                    pause;
+                    
+                    str = input([Gene{i} ': '],'s');
+
+                    if strcmp(str, 'q'); break; end
+                    if ~isempty(str)
+                        Selected = vertcat(Selected, Gene(i));
+                    end
+
+                    if strcmp(str, 'w')
+                        system(['start chrome "http://mouse.brain-map.org/search/show?search_type=gene&search_term=' Gene{i} '"']);
+                        system(['start chrome "http://www.ncbi.nlm.nih.gov/omim/?term=' Gene{i} '"']);
+                    end
+
                 end
                 return
             end
@@ -3727,8 +3811,8 @@ end
 
             if nargin>=2 && (ischar(Gene) || isscalar(Gene)) && ~isempty(Gene)
                 title(sprintf('Size: %s expression', g.IDsToNames(Gene)));
-%             else
-%                 title('tSNE plot');
+            else
+                title('tSNE plot');
             end
         end
         
